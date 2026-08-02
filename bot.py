@@ -162,6 +162,7 @@ def remove_file(path: str) -> None:
 
 async def wait_for_metadata(gid: str, status_msg) -> list:
     last_log = 0.0
+    last_tail = 0.0
     for _ in range(400):
         status = rpc(
             "aria2.tellStatus", [gid, ["status", "files", "errorMessage"]]
@@ -181,6 +182,9 @@ async def wait_for_metadata(gid: str, status_msg) -> list:
                 len(files),
             )
             last_log = now
+        if now - last_tail >= 90:
+            log_aria2_tail(20)
+            last_tail = now
         await asyncio.sleep(3)
     raise DownloadError("timed out while waiting for torrent metadata")
 
