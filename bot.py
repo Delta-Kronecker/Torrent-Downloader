@@ -102,8 +102,18 @@ def start_aria2() -> None:
             "--console-log-level=notice",
             "--file-allocation=none",
             "--enable-dht=true",
-            "--dht-listen-port=6881-6999",
+            "--dht-listen-port=17000-17999",
             "--enable-peer-exchange=true",
+            "--bt-tracker="
+            "udp://tracker.opentrackr.org:1337/announce,"
+            "http://tracker.opentrackr.org:1337/announce,"
+            "udp://tracker.openbittorrent.com:80/announce,"
+            "http://tracker.openbittorrent.com:80/announce,"
+            "udp://open.demonii.com:1337/announce,"
+            "udp://exodus.desync.com:6969/announce,"
+            "udp://open.stealth.si:80/announce,"
+            "udp://tracker.torrent.eu.org:451/announce,"
+            "http://tracker.torrent.eu.org:451/announce",
         ],
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -152,7 +162,7 @@ def remove_file(path: str) -> None:
 
 async def wait_for_metadata(gid: str, status_msg) -> list:
     last_log = 0.0
-    for _ in range(120):
+    for _ in range(400):
         status = rpc(
             "aria2.tellStatus", [gid, ["status", "files", "errorMessage"]]
         )
