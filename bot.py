@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -26,6 +27,7 @@ from telegram.ext import (
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
 )
 logger = logging.getLogger("torrent-bot")
 
@@ -149,6 +151,7 @@ async def wait_for_metadata(gid: str, status_msg) -> list:
 
 async def wait_for_complete(gid: str, status_msg, label: str) -> dict:
     last_report = 0.0
+    last_log = 0.0
     while True:
         status = rpc(
             "aria2.tellStatus",
@@ -165,12 +168,27 @@ async def wait_for_complete(gid: str, status_msg, label: str) -> dict:
         )
         st = status.get("status")
         if st == "complete":
+            logger.info("%s: download complete", label)
             return status
         if st in ("error", "removed"):
+            logger.info("%s: download ended with status %s", label, st)
             raise DownloadError(status.get("errorMessage") or st)
         now = time.monotonic()
         total = int(status.get("totalLength") or 0)
         done = int(status.get("completedLength") or 0)
+        if now - last_log >= 60 and total > 0:
+            pct = done / total * 100
+            speed = int(status.get("downloadSpeed") or 0) / 1024 / 1024
+            logger.info(
+                "%s: %s (%.1f%%) | %.1f / %.1f MB | %.2f MB/s",
+                label,
+                st,
+                pct,
+                done / 1024 / 1024,
+                total / 1024 / 1024,
+                speed,
+            )
+            last_log = now
         if now - last_report >= 10 and total > 0:
             pct = done / total * 100
             speed = int(status.get("downloadSpeed") or 0) / 1024 / 1024
@@ -196,7 +214,17 @@ async def send_file(bot, chat_id: int, path: str, size: int, source: str, label:
             f"{MAX_SEND_SIZE // 1024 // 1024} MB send limit.",
         )
         return
+    logger.info("uploading to user %s: %s (%.1f MB)", chat_id, name, size / 1024 / 1024)
+    start = time.monotonic()
     await bot.send_document(chat_id, document=path, filename=name)
+    elapsed = time.monotonic() - start
+    logger.info(
+        "upload finished for user %s: %s (%.1f MB, %.1fs)",
+        chat_id,
+        name,
+        size / 1024 / 1024,
+        elapsed,
+    )
     await bot.send_message(
         chat_id,
         f"Sent: {name}\nSize: {size / 1024 / 1024:.1f} MB\nSource: {source}",
@@ -225,6 +253,7 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
 
         files = await wait_for_metadata(gid, status_msg)
         total = len(files)
+        logger.info("gid=%s: metadata ready, %d file(s) to download", gid, total)
         await status_msg.edit_text(
             f"Source: {source}\nFiles: {total}\nSending files one by one..."
         )
@@ -233,7 +262,11 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
             index = finfo["index"]
             path = finfo["path"]
             size = int(finfo.get("length") or 0)
-            label = f"[{i}/{total}] {os.path.basename(path)}"
+            name = os.path.basename(path)
+            label = f"[{i}/{total}] {name}"
+            logger.info(
+                "file %d/%d: downloading %s (%.1f MB)", i, total, name, size / 1024 / 1024
+            )
             rpc("aria2.changeOption", [gid, {"select-file": str(index)}])
             await wait_for_complete(gid, status_msg, label)
             await send_file(bot, chat_id, path, size, source, label)
@@ -246,6 +279,7 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
         await bot.send_message(
             chat_id, f"All {total} file(s) downloaded and sent."
         )
+        logger.info("gid=%s: all %d file(s) sent", gid, total)
     except DownloadError as e:
         try:
             await status_msg.edit_text(f"Download failed: {e}")
@@ -281,8 +315,14 @@ async def start_download(update: Update, magnet, torrent_path) -> None:
             )
             return
     if magnet:
+        logger.info("magnet request from user %s: %s", update.effective_user.id, magnet)
         await update.message.reply_text(f"Received: {magnet}")
     else:
+        logger.info(
+            "torrent file request from user %s: %s",
+            update.effective_user.id,
+            os.path.basename(torrent_path),
+        )
         await update.message.reply_text(
             f"Received: {os.path.basename(torrent_path)}"
         )
@@ -300,6 +340,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
+    logger.info("/status requested by user %s", update.effective_user.id)
     gid = state["gid"]
     if not gid:
         await update.message.reply_text("No download in progress.")
@@ -328,6 +369,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
+    logger.info("/cancel requested by user %s", update.effective_user.id)
     gid = state["gid"]
     if not gid:
         await update.message.reply_text("Nothing to cancel.")
