@@ -29,6 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     stream=sys.stdout,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("torrent-bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
