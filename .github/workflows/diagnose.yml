@@ -1,0 +1,26 @@
+name: Diagnose Torrent Network
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Test metadata fetch (Sintel, well-seeded)
+        run: |
+          timeout 90 aria2c --bt-metadata-only=true --bt-save-metadata=true \
+            --enable-dht=true --dht-listen-port=17000-17999 \
+            --bt-tracker="udp://tracker.opentrackr.org:1337/announce,http://tracker.opentrackr.org:1337/announce,udp://tracker.openbittorrent.com:80/announce,http://tracker.openbittorrent.com:80/announce,udp://open.demonii.com:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce" \
+            --console-log-level=notice --summary-interval=5 \
+            --dir=/tmp \
+            "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80"
+          echo "aria2 exit code: $?"
+
+      - name: Check if metadata was saved
+        run: |
+          ls -la /tmp/*.torrent 2>/dev/null || echo "NO METADATA SAVED"
