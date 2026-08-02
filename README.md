@@ -5,7 +5,8 @@ A simple repo that runs a Telegram bot: the user sends a **magnet** link or a **
 ## Features
 
 - Accepts magnet links and .torrent files
-- Sends the downloaded file back (single file, or a zip for multiple files)
+- Downloads and sends files **one by one** (e.g. a series is sent episode by episode)
+- Reports the received link/source and file info (name, size) to the user
 - Shows download progress and speed
 - Cancel download with `/cancel`
 - Restrict access with `ALLOWED_USER_IDS`

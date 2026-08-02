@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Telegram bot: receives magnet / .torrent links, downloads the file with aria2,
-and sends it back to the user. Designed to run on a GitHub Actions workflow."""
+"""Telegram bot: receives magnet / .torrent links, downloads the files one by one
+with aria2, sends each file back to the user, and reports the source link."""
 
 import asyncio
 import base64
@@ -13,7 +13,6 @@ import subprocess
 import tempfile
 import time
 import urllib.request
-import zipfile
 
 from telegram import Update
 from telegram.ext import (
@@ -39,7 +38,7 @@ ALLOWED_USER_IDS = [
 ]
 MAX_RUNTIME_MINUTES = int(os.environ.get("MAX_RUNTIME_MINUTES") or "300")
 MAX_SEND_SIZE = int(os.environ.get("MAX_SEND_SIZE") or str(50 * 1024 * 1024))
-ARIA2_PORT = int(os.environ.get("ARIA2_PORT", "6800"))
+ARIA2_PORT = int(os.environ.get("ARIA2_PORT") or "6800")
 
 MAGNET_RE = re.compile(
     r"(magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}(?:&[^\s]+)?)", re.IGNORECASE
@@ -49,7 +48,7 @@ HELP_TEXT = """\
 Hi! I am a torrent download bot.
 
 Send me a magnet link or a .torrent file and I will download
-the file and send it back to you.
+the files and send them back to you one by one.
 
 Commands:
 /start or /help - this help
@@ -61,6 +60,10 @@ _lock = asyncio.Lock()
 state = {"gid": None}
 base_dir = None
 aria2_proc = None
+
+
+class DownloadError(Exception):
+    pass
 
 
 def is_allowed(user_id: int) -> bool:
@@ -118,42 +121,86 @@ def cleanup_dir(path: str) -> None:
             pass
 
 
-async def send_results(bot, chat_id: int, files: list) -> None:
-    paths = [
-        f["path"]
-        for f in files
-        if f.get("path") and os.path.isfile(f["path"])
-    ]
-    if not paths:
-        await bot.send_message(chat_id, "No files found to send.")
+def remove_file(path: str) -> None:
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        control = path + ".aria2"
+        if os.path.isfile(control):
+            os.remove(control)
+    except OSError:
+        pass
+
+
+async def wait_for_metadata(gid: str, status_msg) -> list:
+    for _ in range(300):
+        status = rpc(
+            "aria2.tellStatus", [gid, ["status", "files", "errorMessage"]]
+        )
+        st = status.get("status")
+        if st in ("error", "removed"):
+            raise DownloadError(status.get("errorMessage") or st)
+        files = status.get("files") or []
+        if files and any(int(f.get("length") or 0) > 0 for f in files):
+            return files
+        await asyncio.sleep(3)
+    raise DownloadError("timed out while waiting for torrent metadata")
+
+
+async def wait_for_complete(gid: str, status_msg, label: str) -> dict:
+    last_report = 0.0
+    while True:
+        status = rpc(
+            "aria2.tellStatus",
+            [
+                gid,
+                [
+                    "status",
+                    "totalLength",
+                    "completedLength",
+                    "downloadSpeed",
+                    "errorMessage",
+                ],
+            ],
+        )
+        st = status.get("status")
+        if st == "complete":
+            return status
+        if st in ("error", "removed"):
+            raise DownloadError(status.get("errorMessage") or st)
+        now = time.monotonic()
+        total = int(status.get("totalLength") or 0)
+        done = int(status.get("completedLength") or 0)
+        if now - last_report >= 10 and total > 0:
+            pct = done / total * 100
+            speed = int(status.get("downloadSpeed") or 0) / 1024 / 1024
+            try:
+                await status_msg.edit_text(
+                    f"{label}: {pct:.1f}% | Speed: {speed:.2f} MB/s"
+                )
+            except Exception:
+                pass
+            last_report = now
+        await asyncio.sleep(3)
+
+
+async def send_file(bot, chat_id: int, path: str, size: int, source: str, label: str) -> None:
+    name = os.path.basename(path)
+    if not os.path.isfile(path):
+        await bot.send_message(chat_id, f"{label}: file not found on disk.")
         return
-
-    sendable = []
-    for p in paths:
-        size = os.path.getsize(p)
-        if size > MAX_SEND_SIZE:
-            await bot.send_message(
-                chat_id,
-                f"File \"{os.path.basename(p)}\" is {size / 1024 / 1024:.1f} MB, "
-                f"which exceeds the bot send limit "
-                f"({MAX_SEND_SIZE // 1024 // 1024} MB).",
-            )
-        else:
-            sendable.append(p)
-
-    if not sendable:
+    if size > MAX_SEND_SIZE:
+        await bot.send_message(
+            chat_id,
+            f"{label}: {size / 1024 / 1024:.1f} MB exceeds the "
+            f"{MAX_SEND_SIZE // 1024 // 1024} MB send limit.",
+        )
         return
-
-    if len(sendable) == 1:
-        await bot.send_document(chat_id, document=sendable[0])
-    else:
-        zip_path = os.path.join(base_dir, "files.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in sendable:
-                zf.write(p, arcname=os.path.basename(p))
-        await bot.send_document(chat_id, document=zip_path)
-
-    await bot.send_message(chat_id, "Done. File(s) sent.")
+    await bot.send_document(chat_id, document=path, filename=name)
+    await bot.send_message(
+        chat_id,
+        f"Sent: {name}\nSize: {size / 1024 / 1024:.1f} MB\nSource: {source}",
+    )
 
 
 async def run_download(update: Update, magnet, torrent_path, status_msg) -> None:
@@ -162,8 +209,12 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
     gid = None
     try:
         if magnet:
-            gid = rpc("aria2.addUri", [[magnet], {"dir": base_dir, "seed-time": "0"}])
+            source = magnet
+            gid = rpc(
+                "aria2.addUri", [[magnet], {"dir": base_dir, "seed-time": "0"}]
+            )
         else:
+            source = f"torrent file: {os.path.basename(torrent_path)}"
             with open(torrent_path, "rb") as f:
                 torrent_b64 = base64.b64encode(f.read()).decode()
             gid = rpc(
@@ -172,47 +223,34 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
             )
         state["gid"] = gid
 
-        last_report = 0.0
-        while True:
-            status = rpc(
-                "aria2.tellStatus",
-                [
-                    gid,
-                    [
-                        "status",
-                        "totalLength",
-                        "completedLength",
-                        "downloadSpeed",
-                        "errorMessage",
-                        "files",
-                    ],
-                ],
-            )
-            st = status.get("status")
-            if st == "complete":
-                await status_msg.edit_text("Download complete. Sending file(s)...")
-                await send_results(bot, chat_id, status.get("files") or [])
-                return
-            if st in ("error", "removed"):
-                await status_msg.edit_text(
-                    f"Download failed: {status.get('errorMessage') or st}"
-                )
-                return
+        files = await wait_for_metadata(gid, status_msg)
+        total = len(files)
+        await status_msg.edit_text(
+            f"Source: {source}\nFiles: {total}\nSending files one by one..."
+        )
 
-            now = time.monotonic()
-            total = int(status.get("totalLength") or 0)
-            done = int(status.get("completedLength") or 0)
-            if now - last_report >= 10 and total > 0:
-                pct = done / total * 100
-                speed = int(status.get("downloadSpeed") or 0) / 1024 / 1024
-                try:
-                    await status_msg.edit_text(
-                        f"Downloading: {pct:.1f}% | Speed: {speed:.2f} MB/s"
-                    )
-                except Exception:
-                    pass
-                last_report = now
-            await asyncio.sleep(3)
+        for i, finfo in enumerate(files, start=1):
+            index = finfo["index"]
+            path = finfo["path"]
+            size = int(finfo.get("length") or 0)
+            label = f"[{i}/{total}] {os.path.basename(path)}"
+            rpc("aria2.changeOption", [gid, {"select-file": str(index)}])
+            await wait_for_complete(gid, status_msg, label)
+            await send_file(bot, chat_id, path, size, source, label)
+            remove_file(path)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id, f"All {total} file(s) downloaded and sent."
+        )
+    except DownloadError as e:
+        try:
+            await status_msg.edit_text(f"Download failed: {e}")
+        except Exception:
+            pass
     except Exception as e:
         logger.exception("download failed")
         try:
@@ -242,6 +280,12 @@ async def start_download(update: Update, magnet, torrent_path) -> None:
                 "Send /cancel or wait for it to finish."
             )
             return
+    if magnet:
+        await update.message.reply_text(f"Received: {magnet}")
+    else:
+        await update.message.reply_text(
+            f"Received: {os.path.basename(torrent_path)}"
+        )
     status_msg = await update.message.reply_text("Starting download...")
     asyncio.create_task(run_download(update, magnet, torrent_path, status_msg))
 
@@ -319,7 +363,9 @@ async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             "For magnet links, just send the link as text."
         )
         return
-    torrent_path = os.path.join(tempfile.gettempdir(), f"upload_{int(time.time())}.torrent")
+    torrent_path = os.path.join(
+        tempfile.gettempdir(), f"upload_{int(time.time())}.torrent"
+    )
     file = await doc.get_file()
     await file.download_to_drive(torrent_path)
     await start_download(update, None, torrent_path)
