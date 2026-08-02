@@ -271,28 +271,51 @@ async def send_file(bot, chat_id: int, path: str, size: int, source: str, label:
     )
 
 
+def add_download(magnet, torrent_path):
+    if magnet:
+        gid = rpc("aria2.addUri", [[magnet], {"dir": base_dir, "seed-time": "0"}])
+        source = magnet
+    else:
+        with open(torrent_path, "rb") as f:
+            torrent_b64 = base64.b64encode(f.read()).decode()
+        gid = rpc(
+            "aria2.addTorrent",
+            [torrent_b64, {"dir": base_dir, "seed-time": "0"}],
+        )
+        source = f"torrent file: {os.path.basename(torrent_path)}"
+    return gid, source
+
+
 async def run_download(update: Update, magnet, torrent_path, status_msg) -> None:
     bot = update.get_bot()
     chat_id = update.effective_chat.id
     gid = None
     try:
-        if magnet:
-            source = magnet
-            gid = rpc(
-                "aria2.addUri", [[magnet], {"dir": base_dir, "seed-time": "0"}]
-            )
-        else:
-            source = f"torrent file: {os.path.basename(torrent_path)}"
-            with open(torrent_path, "rb") as f:
-                torrent_b64 = base64.b64encode(f.read()).decode()
-            gid = rpc(
-                "aria2.addTorrent",
-                [torrent_b64, {"dir": base_dir, "seed-time": "0"}],
-            )
+        gid, source = add_download(magnet, torrent_path)
         state["gid"] = gid
         logger.info("gid=%s: added to aria2 (source: %.80s)", gid, source)
 
-        files = await wait_for_metadata(gid, status_msg)
+        files = None
+        for attempt in range(1, 4):
+            try:
+                files = await wait_for_metadata(gid, status_msg)
+                break
+            except DownloadError as e:
+                if attempt == 3 or "timed out" not in str(e):
+                    raise
+                logger.warning(
+                    "metadata timeout on attempt %d, waiting 30s and retrying", attempt
+                )
+                try:
+                    await status_msg.edit_text(
+                        f"Metadata timeout (attempt {attempt}); retrying..."
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+                gid, source = add_download(magnet, torrent_path)
+                state["gid"] = gid
+                logger.info("gid=%s: re-added to aria2 (source: %.80s)", gid, source)
         total = len(files)
         logger.info("gid=%s: metadata ready, %d file(s) to download", gid, total)
         await status_msg.edit_text(
