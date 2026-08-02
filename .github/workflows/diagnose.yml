@@ -6,21 +6,29 @@ on:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Install aria2
         run: sudo apt-get update && sudo apt-get install -y aria2
 
-      - name: Test metadata fetch (Sintel, well-seeded)
+      - name: Test metadata fetch (Sintel, 5 min, debug log)
         run: |
-          timeout 90 aria2c --bt-metadata-only=true --bt-save-metadata=true \
+          timeout 300 aria2c --bt-metadata-only=true --bt-save-metadata=true \
             --enable-dht=true --dht-listen-port=17000-17999 \
             --bt-tracker="udp://tracker.opentrackr.org:1337/announce,http://tracker.opentrackr.org:1337/announce,udp://tracker.openbittorrent.com:80/announce,http://tracker.openbittorrent.com:80/announce,udp://open.demonii.com:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce" \
-            --console-log-level=notice --summary-interval=5 \
+            --console-log-level=notice --summary-interval=10 \
+            --log=/tmp/aria2-debug.log --log-level=debug \
             --dir=/tmp \
             "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80"
           echo "aria2 exit code: $?"
 
-      - name: Check if metadata was saved
+      - name: Check metadata result
         run: |
-          ls -la /tmp/*.torrent 2>/dev/null || echo "NO METADATA SAVED"
+          ls -la /tmp/*.torrent 2>/dev/null && echo "METADATA OK" || echo "NO METADATA SAVED"
+
+      - name: Dump relevant debug lines
+        run: |
+          echo "=== tracker / announce lines ==="
+          grep -iE "announce|tracker" /tmp/aria2-debug.log | tail -30 || true
+          echo "=== peer / metadata / error lines ==="
+          grep -iE "ut_metadata|metadata|peer|error|exception|timeout" /tmp/aria2-debug.log | tail -60 || true
