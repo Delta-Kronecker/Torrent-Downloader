@@ -62,6 +62,7 @@ _lock = asyncio.Lock()
 state = {"gid": None}
 base_dir = None
 aria2_proc = None
+aria2_log_path = os.path.join(tempfile.gettempdir(), "aria2_console.log")
 
 
 class DownloadError(Exception):
@@ -90,17 +91,21 @@ def rpc(method: str, params=None) -> dict:
 
 def start_aria2() -> None:
     global aria2_proc
+    log_file = open(aria2_log_path, "wb")
     aria2_proc = subprocess.Popen(
         [
             "aria2c",
             "--enable-rpc",
             f"--rpc-listen-port={ARIA2_PORT}",
             "--seed-time=0",
-            "--console-log-level=warn",
+            "--console-log-level=notice",
             "--file-allocation=none",
+            "--enable-dht=true",
+            "--dht-listen-port=6881-6999",
+            "--enable-peer-exchange=true",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
     )
     for _ in range(30):
         try:
@@ -109,6 +114,16 @@ def start_aria2() -> None:
         except Exception:
             time.sleep(1)
     raise RuntimeError("aria2 did not start")
+
+
+def log_aria2_tail(lines: int = 40) -> None:
+    try:
+        with open(aria2_log_path, "rb") as f:
+            tail = f.read().decode(errors="replace").splitlines()[-lines:]
+        for line in tail:
+            logger.warning("aria2: %s", line)
+    except OSError:
+        pass
 
 
 def cleanup_dir(path: str) -> None:
@@ -135,7 +150,8 @@ def remove_file(path: str) -> None:
 
 
 async def wait_for_metadata(gid: str, status_msg) -> list:
-    for _ in range(300):
+    last_log = 0.0
+    for _ in range(120):
         status = rpc(
             "aria2.tellStatus", [gid, ["status", "files", "errorMessage"]]
         )
@@ -145,6 +161,15 @@ async def wait_for_metadata(gid: str, status_msg) -> list:
         files = status.get("files") or []
         if files and any(int(f.get("length") or 0) > 0 for f in files):
             return files
+        now = time.monotonic()
+        if now - last_log >= 15:
+            logger.info(
+                "gid=%s: waiting for torrent metadata (status=%s, %d file entry/entries)",
+                gid,
+                st,
+                len(files),
+            )
+            last_log = now
         await asyncio.sleep(3)
     raise DownloadError("timed out while waiting for torrent metadata")
 
@@ -250,6 +275,7 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
                 [torrent_b64, {"dir": base_dir, "seed-time": "0"}],
             )
         state["gid"] = gid
+        logger.info("gid=%s: added to aria2 (source: %.80s)", gid, source)
 
         files = await wait_for_metadata(gid, status_msg)
         total = len(files)
@@ -281,12 +307,15 @@ async def run_download(update: Update, magnet, torrent_path, status_msg) -> None
         )
         logger.info("gid=%s: all %d file(s) sent", gid, total)
     except DownloadError as e:
+        logger.warning("download failed: %s", e)
+        log_aria2_tail()
         try:
             await status_msg.edit_text(f"Download failed: {e}")
         except Exception:
             pass
     except Exception as e:
         logger.exception("download failed")
+        log_aria2_tail()
         try:
             await status_msg.edit_text(f"Error: {e}")
         except Exception:
