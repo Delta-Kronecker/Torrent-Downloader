@@ -1,0 +1,37 @@
+name: Telegram Torrent Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: torrent-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          MAX_RUNTIME_MINUTES: ${{ secrets.MAX_RUNTIME_MINUTES }}
+        run: python bot.py
